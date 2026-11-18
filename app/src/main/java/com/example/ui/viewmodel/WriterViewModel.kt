@@ -1,0 +1,2095 @@
+package com.example.ui.viewmodel
+
+import android.app.Application
+import android.content.Context
+import android.util.Log
+import androidx.lifecycle.*
+import com.example.data.entity.*
+import com.example.data.local.WriterDatabase
+import com.example.data.models.BlockStyle
+import com.example.data.models.BlockTemplate
+import com.example.data.models.EditorBlock
+import com.example.data.repository.WriterRepository
+import com.example.data.remote.GoogleDriveService
+import com.example.util.FormatExporter
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import android.os.Environment
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+import org.json.JSONArray
+
+data class SyncConflict(
+    val projectId: Long,
+    val projectUuid: String,
+    val localTitle: String,
+    val localUpdatedAt: Long,
+    val remoteFileId: String,
+    val remoteModifiedTime: Long,
+    val remoteContent: String
+)
+
+data class CustomPaletteItem(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val name: String,
+    val primaryHex: String,
+    val bgHex: String = "",
+    val surfaceHex: String = ""
+)
+
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+class WriterViewModel(private val repository: WriterRepository) : ViewModel() {
+
+
+
+    val statistics: StateFlow<List<ProductivityStat>> = repository.statsFlow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // --- Search & Filters ---
+    private val _projectSearchQuery = MutableStateFlow("")
+    val projectSearchQuery: StateFlow<String> = _projectSearchQuery.asStateFlow()
+
+    private val _projectSortBy = MutableStateFlow("MANUAL") // NAME, CREATED, UPDATED, MANUAL
+    val projectSortBy: StateFlow<String> = _projectSortBy.asStateFlow()
+
+    private val _workspaceSortBy = MutableStateFlow("MANUAL") // MANUAL, NAME_ASC, NAME_DESC, DATE_CREATED_DESC, DATE_CREATED_ASC, DATE_MODIFIED_DESC
+    val workspaceSortBy: StateFlow<String> = _workspaceSortBy.asStateFlow()
+
+    fun setProjectSearchQuery(query: String) {
+        _projectSearchQuery.value = query
+    }
+
+    fun setProjectSortBy(sortBy: String) {
+        _projectSortBy.value = sortBy
+    }
+
+    fun setWorkspaceSortBy(sortBy: String) {
+        _workspaceSortBy.value = sortBy
+    }
+
+    // --- Navigation Selection States ---
+    private val _selectedProject = MutableStateFlow<WorkspaceProject?>(null)
+    val selectedProject: StateFlow<WorkspaceProject?> = _selectedProject.asStateFlow()
+
+    private val _selectedFolder = MutableStateFlow<Folder?>(null)
+    val selectedFolder: StateFlow<Folder?> = _selectedFolder.asStateFlow()
+
+    private val _activeDocument = MutableStateFlow<Document?>(null)
+    val activeDocument: StateFlow<Document?> = _activeDocument.asStateFlow()
+
+    private val _appLanguage = MutableStateFlow("system")
+    val appLanguage: StateFlow<String> = _appLanguage.asStateFlow()
+
+    private fun isRu(lang: String): Boolean = com.example.util.LocalizationManager.isRussian(lang)
+
+    private val _themeMode = MutableStateFlow("DARK")
+    val themeMode: StateFlow<String> = _themeMode.asStateFlow()
+
+    private val _colorPalette = MutableStateFlow("GREY")
+    val colorPalette: StateFlow<String> = _colorPalette.asStateFlow()
+
+    private val _customPrimaryColor = MutableStateFlow("#E5A93C")
+    val customPrimaryColor: StateFlow<String> = _customPrimaryColor.asStateFlow()
+
+    private val _customBgColor = MutableStateFlow("")
+    val customBgColor: StateFlow<String> = _customBgColor.asStateFlow()
+
+    private val _customSurfaceColor = MutableStateFlow("")
+    val customSurfaceColor: StateFlow<String> = _customSurfaceColor.asStateFlow()
+
+    private val _savedCustomPalettes = MutableStateFlow<List<CustomPaletteItem>>(emptyList())
+    val savedCustomPalettes: StateFlow<List<CustomPaletteItem>> = _savedCustomPalettes.asStateFlow()
+
+    private val _blockTemplates = MutableStateFlow<List<BlockTemplate>>(emptyList())
+    val blockTemplates: StateFlow<List<BlockTemplate>> = _blockTemplates.asStateFlow()
+
+    private val _interfaceStyle = MutableStateFlow("PIXEL")
+    val interfaceStyle: StateFlow<String> = _interfaceStyle.asStateFlow()
+
+    private val _preferredRefreshRate = MutableStateFlow("AUTO")
+    val preferredRefreshRate: StateFlow<String> = _preferredRefreshRate.asStateFlow()
+
+    private val _bottomBarStyle = MutableStateFlow("STANDARD") // STANDARD, CAPSULE, SEGMENTED
+    val bottomBarStyle: StateFlow<String> = _bottomBarStyle.asStateFlow()
+
+    private val _authorName = MutableStateFlow(com.example.util.LocalizationManager.synchronizeAuthorName("", _appLanguage.value))
+    val authorName: StateFlow<String> = _authorName.asStateFlow()
+
+    private val _authorBio = MutableStateFlow(com.example.util.LocalizationManager.synchronizeAuthorBio("", _appLanguage.value))
+    val authorBio: StateFlow<String> = _authorBio.asStateFlow()
+
+    private val _authorEmail = MutableStateFlow("")
+    val authorEmail: StateFlow<String> = _authorEmail.asStateFlow()
+
+    private val _authorAvatar = MutableStateFlow("")
+    val authorAvatar: StateFlow<String> = _authorAvatar.asStateFlow()
+
+    private val _cloudSyncEnabled = MutableStateFlow(false)
+    val cloudSyncEnabled: StateFlow<Boolean> = _cloudSyncEnabled.asStateFlow()
+
+    private val _localAuthorName = MutableStateFlow(com.example.util.LocalizationManager.synchronizeAuthorName("", _appLanguage.value))
+    val localAuthorName: StateFlow<String> = _localAuthorName.asStateFlow()
+
+    private val _localAuthorBio = MutableStateFlow(com.example.util.LocalizationManager.synchronizeAuthorBio("", _appLanguage.value))
+    val localAuthorBio: StateFlow<String> = _localAuthorBio.asStateFlow()
+
+    private val _localAuthorAvatar = MutableStateFlow("")
+    val localAuthorAvatar: StateFlow<String> = _localAuthorAvatar.asStateFlow()
+
+    // --- Active Projects (Dynamically switched based on active account) ---
+    val activeProjects: StateFlow<List<WorkspaceProject>> = authorEmail
+        .flatMapLatest { email ->
+            val owner = if (email.isEmpty()) "local" else email
+            repository.getActiveProjectsFlow(owner)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val archivedProjects: StateFlow<List<WorkspaceProject>> = authorEmail
+        .flatMapLatest { email ->
+            val owner = if (email.isEmpty()) "local" else email
+            repository.getArchivedProjectsFlow(owner)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val trashProjects: StateFlow<List<WorkspaceProject>> = authorEmail
+        .flatMapLatest { email ->
+            val owner = if (email.isEmpty()) "local" else email
+            repository.getTrashProjectsFlow(owner)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+
+
+
+
+    // Loaded folders & documents list
+    val currentFolders: StateFlow<List<Folder>> = _selectedProject
+        .flatMapLatest { project ->
+            if (project == null) flowOf(emptyList())
+            else repository.getFoldersForProject(project.id)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val currentRootDocuments: StateFlow<List<Document>> = _selectedProject
+        .flatMapLatest { project ->
+            if (project == null) flowOf(emptyList())
+            else repository.getRootDocuments(project.id)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val currentFolderDocuments: StateFlow<List<Document>> = combine(_selectedProject, _selectedFolder) { project, folder ->
+        Pair(project, folder)
+    }
+    .flatMapLatest { (project, folder) ->
+        if (project == null || folder == null) flowOf(emptyList())
+        else repository.getDocumentsByFolder(project.id, folder.id)
+    }
+    .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Editor State variables
+    private val _editorBlocks = MutableStateFlow<List<EditorBlock>>(emptyList())
+    val editorBlocks: StateFlow<List<EditorBlock>> = _editorBlocks.asStateFlow()
+
+    // Undo/Redo Stacks for Editor
+    private val undoStack = mutableListOf<List<EditorBlock>>()
+    private val redoStack = mutableListOf<List<EditorBlock>>()
+
+    // Document Snapshot history
+    val activeDocumentHistory: StateFlow<List<DocumentHistory>> = _activeDocument
+        .flatMapLatest { doc ->
+            if (doc == null) flowOf(emptyList())
+            else repository.getHistoryForDocument(doc.id)
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // Prompter Settings
+    private val _activePrompterSettings = MutableStateFlow<PrompterSettings?>(null)
+    val activePrompterSettings: StateFlow<PrompterSettings?> = _activePrompterSettings.asStateFlow()
+
+    // App Security Configurations
+    private val _isAppLocked = MutableStateFlow(false)
+    val isAppLocked: StateFlow<Boolean> = _isAppLocked.asStateFlow()
+
+    private val _isPinConfigured = MutableStateFlow(false)
+    val isPinConfigured: StateFlow<Boolean> = _isPinConfigured.asStateFlow()
+
+    private var cachedAppPin: String? = null
+
+    // Verification state for lock keys
+    private val _unlockedProjectIds = MutableStateFlow<Set<Long>>(emptySet())
+    val unlockedProjectIds: StateFlow<Set<Long>> = _unlockedProjectIds.asStateFlow()
+
+    // Autosave job
+    private var autosaveJob: Job? = null
+    private val converters = com.example.data.local.Converters()
+
+    init {
+        checkAppPinStatus(lockIfEnabled = true)
+        loadAppLanguage()
+    }
+
+    private val _googleUserId = MutableStateFlow("")
+    val googleUserId: StateFlow<String> = _googleUserId.asStateFlow()
+
+    private val _isSyncing = MutableStateFlow(false)
+    val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
+
+    private val _activeConflict = MutableStateFlow<SyncConflict?>(null)
+    val activeConflict: StateFlow<SyncConflict?> = _activeConflict.asStateFlow()
+
+    private var appContext: Context? = null
+
+    private fun loadAppLanguage() {
+        viewModelScope.launch {
+            val settings = repository.getAllSettingsMap()
+            val loadedLang = settings["app_language"] ?: "system"
+            _appLanguage.value = loadedLang
+            _themeMode.value = settings["theme_mode"] ?: "system"
+            _colorPalette.value = settings["color_palette"] ?: "indigo"
+            _customPrimaryColor.value = settings["custom_primary_color"] ?: "#5C6BC0"
+            _customBgColor.value = settings["custom_bg_color"] ?: ""
+            _customSurfaceColor.value = settings["custom_surface_color"] ?: ""
+            loadSavedCustomPalettes(loadedLang)
+            loadBlockTemplates(loadedLang)
+            _interfaceStyle.value = settings["interface_style"] ?: "pixel"
+            _preferredRefreshRate.value = settings["preferred_refresh_rate"] ?: "auto"
+            _bottomBarStyle.value = settings["bottom_bar_style"] ?: "standard"
+
+            val rawLocalName = settings["local_author_name"] ?: settings["author_name"] ?: "Писатель"
+            val rawLocalBio = settings["local_author_bio"] ?: settings["author_bio"] ?: "Добро пожаловать в вашу творческую студию"
+            _localAuthorName.value = com.example.util.LocalizationManager.synchronizeAuthorName(rawLocalName, loadedLang)
+            _localAuthorBio.value = com.example.util.LocalizationManager.synchronizeAuthorBio(rawLocalBio, loadedLang)
+            _localAuthorAvatar.value = settings["local_author_avatar"] ?: ""
+
+            _authorEmail.value = settings["author_email"] ?: ""
+            _googleUserId.value = settings["google_user_id"] ?: ""
+
+            if (_googleUserId.value.isNotEmpty()) {
+                val rawAuthorName = settings["author_name"] ?: "Писатель"
+                _authorName.value = com.example.util.LocalizationManager.synchronizeAuthorName(rawAuthorName, loadedLang)
+                _authorAvatar.value = settings["author_avatar"] ?: ""
+                _authorBio.value = _localAuthorBio.value
+            } else {
+                _authorName.value = _localAuthorName.value
+                _authorAvatar.value = _localAuthorAvatar.value
+                _authorBio.value = _localAuthorBio.value
+            }
+
+            _cloudSyncEnabled.value = settings["cloud_sync_enabled"]?.toBooleanStrictOrNull() ?: false
+        }
+    }
+
+    fun setLocalAuthorProfile(name: String, bio: String) {
+        viewModelScope.launch {
+            repository.saveLocalAuthorName(name)
+            repository.saveLocalAuthorBio(bio)
+            _localAuthorName.value = name
+            _localAuthorBio.value = bio
+            if (_googleUserId.value.isEmpty()) {
+                _authorName.value = name
+                _authorBio.value = bio
+            }
+        }
+    }
+
+    fun setLocalAuthorAvatar(path: String) {
+        viewModelScope.launch {
+            repository.saveLocalAuthorAvatar(path)
+            _localAuthorAvatar.value = path
+            if (_googleUserId.value.isEmpty()) {
+                _authorAvatar.value = path
+            }
+        }
+    }
+
+    fun setAuthorAvatar(path: String) {
+        viewModelScope.launch {
+            repository.saveAuthorAvatar(path)
+            _authorAvatar.value = path
+        }
+    }
+
+    fun setCloudSyncEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            repository.saveCloudSyncEnabled(enabled)
+            _cloudSyncEnabled.value = enabled
+            if (enabled) {
+                appContext?.let { syncAllWithDrive(it) }
+            }
+        }
+    }
+
+    fun linkGoogleAccount(
+        context: Context,
+        gId: String,
+        displayName: String,
+        email: String,
+        photoUrl: String
+    ) {
+        Log.d("GoogleSignIn", "[Google Link Initiated] Linking google account: Email='$email', ID='$gId', Name='$displayName'")
+        viewModelScope.launch {
+            try {
+                repository.saveAuthorName(displayName)
+                repository.saveAuthorEmail(email)
+                repository.saveAuthorAvatar(photoUrl)
+                repository.saveGoogleUserId(gId)
+                repository.saveCloudSyncEnabled(true)
+
+                _authorName.value = displayName
+                _authorEmail.value = email
+                _authorAvatar.value = photoUrl
+                _googleUserId.value = gId
+                _cloudSyncEnabled.value = true
+                Log.d("GoogleSignIn", "[Google Link Saved] Account data successfully stored locally in SQLite settings DB.")
+
+                syncAllWithDrive(context)
+            } catch (e: Exception) {
+                Log.e("GoogleSignIn", "[Google Link Failed] Error saving account details: ${e.message}", e)
+            }
+        }
+    }
+
+    fun disconnectGoogleAccount(context: Context) {
+        Log.d("GoogleSignIn", "[Google Disconnect] Dissociating Google account and disabling sync.")
+        viewModelScope.launch {
+            try {
+                // Sign out Google Client so user picker forces account select next time
+                val gso = com.google.android.gms.auth.api.signin.GoogleSignInOptions.Builder(
+                    com.google.android.gms.auth.api.signin.GoogleSignInOptions.DEFAULT_SIGN_IN
+                ).build()
+                val client = com.google.android.gms.auth.api.signin.GoogleSignIn.getClient(context, gso)
+                client.signOut().addOnCompleteListener {
+                    Log.d("GoogleSignIn", "[Google Disconnect] GoogleSignInClient signOut complete.")
+                }
+            } catch (e: Exception) {
+                Log.e("GoogleSignIn", "[Google Disconnect] Error during Google Play Services client signOut: ${e.message}", e)
+            }
+
+            try {
+                // DO NOT delete synced projects locally anymore. We keep them segregated in local DB and switch view flows.
+                _selectedProject.value = null
+                _selectedFolder.value = null
+                _activeDocument.value = null
+
+                repository.saveAuthorEmail("")
+                repository.saveAuthorAvatar("")
+                repository.saveGoogleUserId("")
+                repository.saveCloudSyncEnabled(false)
+
+                _authorEmail.value = ""
+                _googleUserId.value = ""
+                _cloudSyncEnabled.value = false
+
+                // Revert active states to local profile values!
+                _authorName.value = _localAuthorName.value
+                _authorBio.value = _localAuthorBio.value
+                _authorAvatar.value = _localAuthorAvatar.value
+                Log.d("GoogleSignIn", "[Google Disconnect] Active profile reverted to local settings.")
+            } catch (e: Exception) {
+                Log.e("GoogleSignIn", "[Google Disconnect] Error clearing account details: ${e.message}", e)
+            }
+        }
+    }
+
+    fun checkAndRestoreGoogleSession(context: Context) {
+        viewModelScope.launch {
+            Log.d("GoogleSignIn", "[Session Check] --- Starting startup session check ---")
+            val storedUserId = repository.getGoogleUserId()
+            val storedEmail = repository.getAuthorEmail()
+            val storedName = repository.getAuthorName()
+            Log.d("GoogleSignIn", "[Session Check] Stored settings credentials: id='$storedUserId', email='$storedEmail', name='$storedName'")
+
+            // 1. Double check cached auth session using GoogleSignIn API
+            try {
+                val account = com.google.android.gms.auth.api.signin.GoogleSignIn.getLastSignedInAccount(context)
+                if (account != null) {
+                    val email = account.email ?: ""
+                    val displayName = account.displayName ?: "Google User"
+                    val photoUrl = account.photoUrl?.toString() ?: ""
+                    val gId = account.id ?: ""
+
+                    Log.d("GoogleSignIn", "[Session Check] Found cached GoogleSignIn account session: email='$email', id='$gId'")
+
+                    if (email.isNotEmpty()) {
+                        repository.saveAuthorName(displayName)
+                        repository.saveAuthorEmail(email)
+                        repository.saveAuthorAvatar(photoUrl)
+                        repository.saveGoogleUserId(gId)
+                        repository.saveCloudSyncEnabled(true)
+
+                        _authorName.value = displayName
+                        _authorEmail.value = email
+                        _authorAvatar.value = photoUrl
+                        _googleUserId.value = gId
+                        _cloudSyncEnabled.value = true
+
+                        Log.d("GoogleSignIn", "[Session Check] Session restored successfully from cached Google API account.")
+                        syncAllWithDrive(context)
+                        return@launch
+                    }
+                } else {
+                    Log.d("GoogleSignIn", "[Session Check] No active cached account found via GoogleSignIn.getLastSignedInAccount.")
+                }
+            } catch (e: Exception) {
+                Log.e("GoogleSignIn", "[Session Check] Exception verifying GoogleSignIn cache: ${e.message}", e)
+            }
+
+            // 2. Fallback to Silent Sign-in if we have locally stored credentials but play service cache is cold
+            if (storedUserId.isNotEmpty() && storedEmail.isNotEmpty()) {
+                Log.d("GoogleSignIn", "[Session Check] Found local DB credentials but cold Play Services cache. Attempting silent sign-in...")
+                try {
+                    val gso = com.google.android.gms.auth.api.signin.GoogleSignInOptions.Builder(
+                        com.google.android.gms.auth.api.signin.GoogleSignInOptions.DEFAULT_SIGN_IN
+                    )
+                        .requestEmail()
+                        .requestProfile()
+                        .requestScopes(com.google.android.gms.common.api.Scope("https://www.googleapis.com/auth/drive.file"))
+                        .build()
+                    val signInClient = com.google.android.gms.auth.api.signin.GoogleSignIn.getClient(context, gso)
+                    signInClient.silentSignIn().addOnCompleteListener { task ->
+                        if (task.isSuccessful) {
+                            val silentAccount = task.result
+                            Log.d("GoogleSignIn", "[Session Check] Silent Sign-In succeeded for '${silentAccount?.email}'")
+                            if (silentAccount != null) {
+                                val email = silentAccount.email ?: ""
+                                val displayName = silentAccount.displayName ?: "Google User"
+                                val photoUrl = silentAccount.photoUrl?.toString() ?: ""
+                                val gId = silentAccount.id ?: ""
+
+                                viewModelScope.launch {
+                                    repository.saveAuthorName(displayName)
+                                    repository.saveAuthorEmail(email)
+                                    repository.saveAuthorAvatar(photoUrl)
+                                    repository.saveGoogleUserId(gId)
+                                    repository.saveCloudSyncEnabled(true)
+
+                                    _authorName.value = displayName
+                                    _authorEmail.value = email
+                                    _authorAvatar.value = photoUrl
+                                    _googleUserId.value = gId
+                                    _cloudSyncEnabled.value = true
+                                    Log.d("GoogleSignIn", "[Session Check] Local profile successfully synchronized with silenly logged-in Google account.")
+                                    syncAllWithDrive(context)
+                                }
+                            }
+                        } else {
+                            Log.w("GoogleSignIn", "[Session Check] Silent Sign-In failed: ${task.exception?.message}")
+                            // Keep DB account anyway (sandbox/offline tolerance)
+                            Log.d("GoogleSignIn", "[Session Check] Maintaining DB cached state as fallback to preserve unsynced local content.")
+                            syncAllWithDrive(context)
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e("GoogleSignIn", "[Session Check] Silentsignin setup error: ${e.message}", e)
+                }
+            } else {
+                Log.d("GoogleSignIn", "[Session Check] No active Google authorization exists locally or remotely. Staying in offline mode.")
+            }
+        }
+    }
+
+    fun syncAllWithDrive(context: Context) {
+        val email = _authorEmail.value
+        if (email.isEmpty()) return
+        if (!_cloudSyncEnabled.value) return
+
+        viewModelScope.launch {
+            if (_isSyncing.value) return@launch
+            _isSyncing.value = true
+            try {
+                Log.d("WriterViewModel", "Starting full sync with Google Drive")
+                val folderId = GoogleDriveService.getOrCreateAppFolder(context, email)
+                if (folderId == null) {
+                    Log.e("WriterViewModel", "Failed to get or create Google Drive app folder")
+                    _isSyncing.value = false
+                    return@launch
+                }
+
+                val remoteFiles = GoogleDriveService.listAllProjectFiles(context, email, folderId)
+                val remoteUuids = remoteFiles.map { it.uuid }.toSet()
+                val localProjects = repository.getAllProjectsDirectList()
+
+                val localUuidsToPids = mutableMapOf<String, Long>()
+                val localPidsToUuids = mutableMapOf<Long, String>()
+                for (p in localProjects) {
+                    val uuid = repository.getProjectUuid(p.id)
+                    localUuidsToPids[uuid] = p.id
+                    localPidsToUuids[p.id] = uuid
+                }
+
+                for (remoteFile in remoteFiles) {
+                    val localPID = localUuidsToPids[remoteFile.uuid]
+                    if (localPID != null) {
+                        val localProj = repository.getProjectById(localPID)
+                        if (localProj != null) {
+                            val lastSyncLocal = repository.getLastSyncLocal(localProj.id)
+                            val lastSyncRemote = repository.getLastSyncRemote(localProj.id)
+
+                            if (lastSyncLocal != 0L && lastSyncRemote != 0L) {
+                                val hasLocalChanged = localProj.updatedAt > lastSyncLocal
+                                val hasRemoteChanged = remoteFile.modifiedTime > lastSyncRemote
+
+                                if (hasLocalChanged && hasRemoteChanged) {
+                                    Log.w("WriterViewModel", "Conflict detected for project ${localProj.title}!")
+                                    val remoteContent = GoogleDriveService.downloadFileContent(context, email, remoteFile.fileId) ?: ""
+                                    _activeConflict.value = SyncConflict(
+                                        projectId = localProj.id,
+                                        projectUuid = remoteFile.uuid,
+                                        localTitle = localProj.title,
+                                        localUpdatedAt = localProj.updatedAt,
+                                        remoteFileId = remoteFile.fileId,
+                                        remoteModifiedTime = remoteFile.modifiedTime,
+                                        remoteContent = remoteContent
+                                    )
+                                    // Skip auto sync for this project until resolved
+                                    continue
+                                } else if (hasRemoteChanged) {
+                                    Log.d("WriterViewModel", "[Sync] Remote is newer (tick) for ${localProj.title}. Downloading...")
+                                    val fileContent = GoogleDriveService.downloadFileContent(context, email, remoteFile.fileId)
+                                    if (fileContent != null) {
+                                        repository.importProjectFromJson(fileContent, email)
+                                        val updatedProj = repository.getProjectById(localProj.id)
+                                        val finalLocalTick = updatedProj?.updatedAt ?: localProj.updatedAt
+                                        repository.saveSyncTicks(localProj.id, finalLocalTick, remoteFile.modifiedTime)
+                                    }
+                                } else if (hasLocalChanged) {
+                                    Log.d("WriterViewModel", "[Sync] Local is newer (tick) for ${localProj.title}. Uploading...")
+                                    val fileContent = repository.serializeProjectToJson(localProj.id)
+                                    val success = GoogleDriveService.uploadFileMedia(context, email, remoteFile.fileId, fileContent)
+                                    if (success) {
+                                        val updatedFileMetadata = GoogleDriveService.findProjectFile(context, email, folderId, remoteFile.uuid)
+                                        val newRemoteModifiedTime = updatedFileMetadata?.second ?: System.currentTimeMillis()
+                                        repository.saveSyncTicks(localProj.id, localProj.updatedAt, newRemoteModifiedTime)
+                                    }
+                                } else {
+                                    // In sync
+                                    repository.saveSyncTicks(localProj.id, localProj.updatedAt, remoteFile.modifiedTime)
+                                }
+                            } else {
+                                // No sync ticks history yet, fallback to naive comparisons
+                                if (remoteFile.modifiedTime > localProj.updatedAt) {
+                                    Log.d("WriterViewModel", "[Initial Sync] Remote is newer for ${localProj.title}. Downloading...")
+                                    val fileContent = GoogleDriveService.downloadFileContent(context, email, remoteFile.fileId)
+                                    if (fileContent != null) {
+                                        repository.importProjectFromJson(fileContent, email)
+                                        val updatedProj = repository.getProjectById(localProj.id)
+                                        val finalLocalTick = updatedProj?.updatedAt ?: localProj.updatedAt
+                                        repository.saveSyncTicks(localProj.id, finalLocalTick, remoteFile.modifiedTime)
+                                    }
+                                } else if (localProj.updatedAt > remoteFile.modifiedTime) {
+                                    Log.d("WriterViewModel", "[Initial Sync] Local is newer for ${localProj.title}. Uploading...")
+                                    val fileContent = repository.serializeProjectToJson(localProj.id)
+                                    val success = GoogleDriveService.uploadFileMedia(context, email, remoteFile.fileId, fileContent)
+                                    if (success) {
+                                        val updatedFileMetadata = GoogleDriveService.findProjectFile(context, email, folderId, remoteFile.uuid)
+                                        val newRemoteModifiedTime = updatedFileMetadata?.second ?: System.currentTimeMillis()
+                                        repository.saveSyncTicks(localProj.id, localProj.updatedAt, newRemoteModifiedTime)
+                                    }
+                                } else {
+                                    repository.saveSyncTicks(localProj.id, localProj.updatedAt, remoteFile.modifiedTime)
+                                }
+                            }
+                        }
+                    } else {
+                        Log.d("WriterViewModel", "Found brand-new remote project with UUID ${remoteFile.uuid}. Downloading...")
+                        val fileContent = GoogleDriveService.downloadFileContent(context, email, remoteFile.fileId)
+                        if (fileContent != null) {
+                            repository.importProjectFromJson(fileContent, email)
+                            val newPid = repository.getProjectIdByUuid(remoteFile.uuid)
+                            if (newPid != null) {
+                                val newProj = repository.getProjectById(newPid)
+                                val finalLocalTick = newProj?.updatedAt ?: System.currentTimeMillis()
+                                repository.saveSyncTicks(newPid, finalLocalTick, remoteFile.modifiedTime)
+                            }
+                        }
+                    }
+                }
+
+                for (localProj in localProjects) {
+                    val uuid = localPidsToUuids[localProj.id] ?: continue
+                    if (uuid !in remoteUuids) {
+                        Log.d("WriterViewModel", "Local project ${localProj.title} has no remote counterpart. Uploading...")
+                        val fileContent = repository.serializeProjectToJson(localProj.id)
+                        val success = GoogleDriveService.createAndUploadProjectFile(context, email, folderId, uuid, fileContent)
+                        if (success) {
+                            val updatedFileMetadata = GoogleDriveService.findProjectFile(context, email, folderId, uuid)
+                            val newRemoteModifiedTime = updatedFileMetadata?.second ?: System.currentTimeMillis()
+                            repository.saveSyncTicks(localProj.id, localProj.updatedAt, newRemoteModifiedTime)
+                        }
+                    }
+                }
+
+                repository.savePendingSyncProjectIds(emptySet())
+                Log.d("WriterViewModel", "Google Drive sync completed successfully")
+            } catch (e: Exception) {
+                Log.e("WriterViewModel", "Error in syncAllWithDrive: ${e.message}", e)
+            } finally {
+                _isSyncing.value = false
+            }
+        }
+    }
+
+    fun resolveConflictWithLocal(conflict: SyncConflict, context: Context) {
+        val email = _authorEmail.value
+        if (email.isEmpty()) return
+        viewModelScope.launch {
+            if (_isSyncing.value) return@launch
+            _isSyncing.value = true
+            try {
+                val folderId = GoogleDriveService.getOrCreateAppFolder(context, email) ?: return@launch
+                val fileContent = repository.serializeProjectToJson(conflict.projectId)
+                val success = GoogleDriveService.uploadFileMedia(context, email, conflict.remoteFileId, fileContent)
+                if (success) {
+                    val updatedFileMetadata = GoogleDriveService.findProjectFile(context, email, folderId, conflict.projectUuid)
+                    val newRemoteModifiedTime = updatedFileMetadata?.second ?: System.currentTimeMillis()
+                    repository.saveSyncTicks(conflict.projectId, conflict.localUpdatedAt, newRemoteModifiedTime)
+                }
+            } catch (e: Exception) {
+                Log.e("WriterViewModel", "Error resolving conflict with local: ${e.message}")
+            } finally {
+                _isSyncing.value = false
+                _activeConflict.value = null
+            }
+        }
+    }
+
+    fun resolveConflictWithCloud(conflict: SyncConflict, context: Context) {
+        val email = _authorEmail.value
+        viewModelScope.launch {
+            if (_isSyncing.value) return@launch
+            _isSyncing.value = true
+            try {
+                val success = repository.importProjectFromJson(conflict.remoteContent, email.ifEmpty { null })
+                if (success) {
+                    val updatedProj = repository.getProjectById(conflict.projectId)
+                    val finalLocalTick = updatedProj?.updatedAt ?: conflict.localUpdatedAt
+                    repository.saveSyncTicks(conflict.projectId, finalLocalTick, conflict.remoteModifiedTime)
+                }
+            } catch (e: Exception) {
+                Log.e("WriterViewModel", "Error resolving conflict with cloud: ${e.message}")
+            } finally {
+                _isSyncing.value = false
+                _activeConflict.value = null
+            }
+        }
+    }
+
+    fun resolveConflictWithMerge(conflict: SyncConflict, context: Context) {
+        val email = _authorEmail.value
+        if (email.isEmpty()) return
+        viewModelScope.launch {
+            if (_isSyncing.value) return@launch
+            _isSyncing.value = true
+            try {
+                // 1. Mark local project as synced with current ticks to stop conflict loop
+                repository.saveSyncTicks(conflict.projectId, conflict.localUpdatedAt, conflict.remoteModifiedTime)
+
+                // 2. Import cloud copy under new UUID & modified title
+                val jsonObj = JSONObject(conflict.remoteContent)
+                val newUuid = java.util.UUID.randomUUID().toString()
+                val originalTitle = jsonObj.optString("title", "Project")
+                jsonObj.put("uuid", newUuid)
+                jsonObj.put("title", "$originalTitle (Cloud Copy)")
+
+                val imported = repository.importProjectFromJson(jsonObj.toString(), email)
+                if (imported) {
+                    val newProjectId = repository.getProjectIdByUuid(newUuid)
+                    if (newProjectId != null) {
+                        val newProj = repository.getProjectById(newProjectId)
+                        val newLocalTick = newProj?.updatedAt ?: System.currentTimeMillis()
+                        repository.saveSyncTicks(newProjectId, newLocalTick, 0L)
+                        markProjectDirtyAndSync(context, newProjectId)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("WriterViewModel", "Error resolving conflict with merge: ${e.message}")
+            } finally {
+                _isSyncing.value = false
+                _activeConflict.value = null
+            }
+        }
+    }
+
+    fun markProjectDirtyAndSync(context: Context, projectId: Long) {
+        viewModelScope.launch {
+            val pending = repository.getPendingSyncProjectIds().toMutableSet()
+            pending.add(projectId)
+            repository.savePendingSyncProjectIds(pending)
+            syncPendingProjects(context)
+        }
+    }
+
+    fun syncPendingProjects(context: Context) {
+        val email = _authorEmail.value
+        if (email.isEmpty() || !_cloudSyncEnabled.value) return
+
+        viewModelScope.launch {
+            if (_isSyncing.value) return@launch
+            _isSyncing.value = true
+            try {
+                val pending = repository.getPendingSyncProjectIds()
+                if (pending.isEmpty()) return@launch
+
+                val folderId = GoogleDriveService.getOrCreateAppFolder(context, email) ?: return@launch
+                val syncedSuccessfully = mutableSetOf<Long>()
+
+                for (pid in pending) {
+                    try {
+                        val uuid = repository.getProjectUuid(pid)
+                        val projectContent = repository.serializeProjectToJson(pid)
+                        if (projectContent.isEmpty()) {
+                            syncedSuccessfully.add(pid)
+                            continue
+                        }
+
+                        val existingFile = GoogleDriveService.findProjectFile(context, email, folderId, uuid)
+                        val success = if (existingFile != null) {
+                            GoogleDriveService.uploadFileMedia(context, email, existingFile.first, projectContent)
+                        } else {
+                            GoogleDriveService.createAndUploadProjectFile(context, email, folderId, uuid, projectContent)
+                        }
+
+                        if (success) {
+                            syncedSuccessfully.add(pid)
+                        }
+                    } catch (e: Exception) {
+                        Log.e("WriterViewModel", "Failed to sync pending project $pid: ${e.message}")
+                    }
+                }
+
+                if (syncedSuccessfully.isNotEmpty()) {
+                    val updatedPending = repository.getPendingSyncProjectIds().toMutableSet()
+                    updatedPending.removeAll(syncedSuccessfully)
+                    repository.savePendingSyncProjectIds(updatedPending)
+                }
+            } finally {
+                _isSyncing.value = false
+            }
+        }
+    }
+
+    private fun triggerProjectSync(projectId: Long) {
+        val context = appContext ?: return
+        markProjectDirtyAndSync(context, projectId)
+    }
+
+    private var networkCallback: android.net.ConnectivityManager.NetworkCallback? = null
+
+    fun initNetworkListener(context: Context) {
+        appContext = context.applicationContext
+        val appContextLoc = context.applicationContext
+        val cm = appContextLoc.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager ?: return
+
+        if (networkCallback != null) return
+
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                super.onAvailable(network)
+                Log.d("WriterViewModel", "Network restored. Triggering auto-sync of pending queue.")
+                syncPendingProjects(appContextLoc)
+                syncAllWithDrive(appContextLoc)
+            }
+        }
+        networkCallback = callback
+        try {
+            val request = android.net.NetworkRequest.Builder()
+                .addCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+    fun setAuthorProfile(name: String, bio: String, email: String) {
+        viewModelScope.launch {
+            repository.saveAuthorName(name)
+            repository.saveAuthorBio(bio)
+            repository.saveAuthorEmail(email)
+            _authorName.value = name
+            _authorBio.value = bio
+            _authorEmail.value = email
+        }
+    }
+
+    fun setAppLanguage(lang: String) {
+        _appLanguage.value = lang
+        // Immediately synchronize in-memory templates, palettes, author profile, and active editor blocks
+        val syncedTemplates = _blockTemplates.value.map { tpl ->
+            tpl.copy(
+                name = com.example.util.LocalizationManager.translateTemplateName(tpl.name, lang),
+                customTypeName = tpl.customTypeName?.let { com.example.util.LocalizationManager.translateBlockBadge(it, lang) },
+                customPrefix = tpl.customPrefix?.let { com.example.util.LocalizationManager.translateBlockPrefix(it, lang) }
+            )
+        }
+        if (syncedTemplates.isNotEmpty()) {
+            _blockTemplates.value = syncedTemplates
+        }
+        val syncedPalettes = _savedCustomPalettes.value.map { pal ->
+            pal.copy(name = com.example.util.LocalizationManager.translatePaletteName(pal.name, lang))
+        }
+        if (syncedPalettes.isNotEmpty()) {
+            _savedCustomPalettes.value = syncedPalettes
+        }
+        _localAuthorName.value = com.example.util.LocalizationManager.synchronizeAuthorName(_localAuthorName.value, lang)
+        _localAuthorBio.value = com.example.util.LocalizationManager.synchronizeAuthorBio(_localAuthorBio.value, lang)
+        if (_googleUserId.value.isEmpty()) {
+            _authorName.value = _localAuthorName.value
+            _authorBio.value = _localAuthorBio.value
+        } else {
+            _authorBio.value = _localAuthorBio.value
+        }
+        if (_editorBlocks.value.isNotEmpty()) {
+            var blocksChanged = false
+            val updatedBlocks = _editorBlocks.value.map { block ->
+                var b = block
+                if (b.type == "scene" && com.example.util.LocalizationManager.isDefaultSceneHeading(b.text)) {
+                    val newHeading = com.example.util.LocalizationManager.getDefaultSceneHeading(lang)
+                    if (b.text != newHeading) {
+                        b = b.copy(text = newHeading)
+                        blocksChanged = true
+                    }
+                }
+                if (b.type == "custom") {
+                    val newBadge = b.customTypeName?.let { com.example.util.LocalizationManager.translateBlockBadge(it, lang) }
+                    val newPrefix = b.customPrefix?.let { com.example.util.LocalizationManager.translateBlockPrefix(it, lang) }
+                    if (newBadge != b.customTypeName || newPrefix != b.customPrefix) {
+                        b = b.copy(customTypeName = newBadge, customPrefix = newPrefix)
+                        blocksChanged = true
+                    }
+                }
+                b
+            }
+            if (blocksChanged) {
+                _editorBlocks.value = updatedBlocks
+                saveActiveDocumentImmediate()
+            }
+        }
+        viewModelScope.launch {
+            repository.saveAppLanguage(lang)
+            loadBlockTemplates(lang)
+            loadSavedCustomPalettes(lang)
+        }
+    }
+
+    fun setThemeMode(themeId: String) {
+        viewModelScope.launch {
+            repository.saveThemeMode(themeId)
+            _themeMode.value = themeId
+        }
+    }
+
+    fun setColorPalette(paletteId: String) {
+        viewModelScope.launch {
+            repository.saveColorPalette(paletteId)
+            _colorPalette.value = paletteId
+        }
+    }
+
+    private fun loadSavedCustomPalettes(langOverride: String? = null) {
+        viewModelScope.launch {
+            val lang = langOverride ?: _appLanguage.value
+            val json = repository.getSavedCustomPalettesJson()
+            if (json.isNotBlank()) {
+                try {
+                    val array = org.json.JSONArray(json)
+                    val list = mutableListOf<CustomPaletteItem>()
+                    for (i in 0 until array.length()) {
+                        val obj = array.getJSONObject(i)
+                        val rawName = obj.optString("name", com.example.util.LocalizationManager.tr("Палитра", "Palette", lang))
+                        list.add(
+                            CustomPaletteItem(
+                                id = obj.optString("id", java.util.UUID.randomUUID().toString()),
+                                name = com.example.util.LocalizationManager.translatePaletteName(rawName, lang),
+                                primaryHex = obj.optString("primaryHex", "#E5A93C"),
+                                bgHex = obj.optString("bgHex", ""),
+                                surfaceHex = obj.optString("surfaceHex", "")
+                            )
+                        )
+                    }
+                    _savedCustomPalettes.value = list
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+            }
+        }
+    }
+
+    private fun persistCustomPalettes(list: List<CustomPaletteItem>) {
+        viewModelScope.launch {
+            try {
+                val array = org.json.JSONArray()
+                for (item in list) {
+                    val obj = org.json.JSONObject().apply {
+                        put("id", item.id)
+                        put("name", item.name)
+                        put("primaryHex", item.primaryHex)
+                        put("bgHex", item.bgHex)
+                        put("surfaceHex", item.surfaceHex)
+                    }
+                    array.put(obj)
+                }
+                repository.saveSavedCustomPalettesJson(array.toString())
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun applyCustomPalette(primaryHex: String, bgHex: String = "", surfaceHex: String = "") {
+        viewModelScope.launch {
+            repository.saveCustomPrimaryColor(primaryHex)
+            repository.saveCustomBgColor(bgHex)
+            repository.saveCustomSurfaceColor(surfaceHex)
+            _customPrimaryColor.value = primaryHex
+            _customBgColor.value = bgHex
+            _customSurfaceColor.value = surfaceHex
+            setColorPalette("CUSTOM")
+        }
+    }
+
+    fun saveAndApplyCustomPalette(name: String, primaryHex: String, bgHex: String = "", surfaceHex: String = "") {
+        viewModelScope.launch {
+            val currentList = _savedCustomPalettes.value.toMutableList()
+            val lang = _appLanguage.value
+            val defaultName = com.example.util.LocalizationManager.translatePaletteName("Palette ${currentList.size + 1}", lang)
+            val newItem = CustomPaletteItem(
+                name = name.ifBlank { defaultName },
+                primaryHex = primaryHex,
+                bgHex = bgHex,
+                surfaceHex = surfaceHex
+            )
+            currentList.add(0, newItem)
+            _savedCustomPalettes.value = currentList
+            persistCustomPalettes(currentList)
+            applyCustomPalette(primaryHex, bgHex, surfaceHex)
+        }
+    }
+
+    fun deleteSavedCustomPalette(id: String) {
+        viewModelScope.launch {
+            val updated = _savedCustomPalettes.value.filter { it.id != id }
+            _savedCustomPalettes.value = updated
+            persistCustomPalettes(updated)
+        }
+    }
+
+    fun resetPaletteToDefault() {
+        viewModelScope.launch {
+            repository.saveCustomPrimaryColor("#E5A93C")
+            repository.saveCustomBgColor("")
+            repository.saveCustomSurfaceColor("")
+            _customPrimaryColor.value = "#E5A93C"
+            _customBgColor.value = ""
+            _customSurfaceColor.value = ""
+            setColorPalette("GREY")
+        }
+    }
+
+    private fun getDefaultBlockTemplates(langOverride: String? = null): List<BlockTemplate> {
+        val lang = langOverride ?: _appLanguage.value
+        return listOf(
+            BlockTemplate(
+                name = com.example.util.LocalizationManager.translateTemplateName("Voiceover", lang),
+                typeId = "custom",
+                customTypeName = com.example.util.LocalizationManager.translateBlockBadge("V.O.", lang),
+                customColorHex = "#7B1FA2",
+                customIconName = "mic|monospace",
+                customPrefix = com.example.util.LocalizationManager.translateBlockPrefix("[V.O.]", lang),
+                alignment = "CENTER",
+                style = BlockStyle(isItalic = true)
+            ),
+            BlockTemplate(
+                name = com.example.util.LocalizationManager.translateTemplateName("Title on screen", lang),
+                typeId = "custom",
+                customTypeName = com.example.util.LocalizationManager.translateBlockBadge("TITLE", lang),
+                customColorHex = "#0288D1",
+                customIconName = "subtitles|monospace",
+                customPrefix = com.example.util.LocalizationManager.translateBlockPrefix("TITLE:", lang),
+                alignment = "CENTER",
+                style = BlockStyle(isBold = true)
+            ),
+            BlockTemplate(
+                name = com.example.util.LocalizationManager.translateTemplateName("Sound Effect", lang),
+                typeId = "custom",
+                customTypeName = com.example.util.LocalizationManager.translateBlockBadge("SFX", lang),
+                customColorHex = "#E65100",
+                customIconName = "sfx|monospace",
+                customPrefix = com.example.util.LocalizationManager.translateBlockPrefix("SFX:", lang),
+                alignment = "LEFT",
+                style = BlockStyle(isBold = true)
+            ),
+            BlockTemplate(
+                name = com.example.util.LocalizationManager.translateTemplateName("Director's Note", lang),
+                typeId = "custom",
+                customTypeName = com.example.util.LocalizationManager.translateBlockBadge("NOTE", lang),
+                customColorHex = "#E5A93C",
+                customIconName = "note|sans",
+                customPrefix = "//",
+                alignment = "LEFT",
+                style = BlockStyle(isItalic = true)
+            )
+        )
+    }
+
+    private fun loadBlockTemplates(langOverride: String? = null) {
+        viewModelScope.launch {
+            val lang = langOverride ?: _appLanguage.value
+            val json = repository.getBlockTemplatesJson()
+            if (json.isNotBlank()) {
+                try {
+                    val array = org.json.JSONArray(json)
+                    val list = mutableListOf<BlockTemplate>()
+                    for (i in 0 until array.length()) {
+                        val obj = array.getJSONObject(i)
+                        val defaultName = com.example.util.LocalizationManager.tr("Шаблон", "Template", lang)
+                        val defaultBadge = com.example.util.LocalizationManager.translateBlockBadge("CUSTOM", lang)
+                        val rawName = com.example.util.LocalizationManager.translateTemplateName(
+                            obj.optString("name", defaultName),
+                            lang
+                        )
+                        val rawTypeName = com.example.util.LocalizationManager.translateBlockBadge(
+                            obj.optString("customTypeName", defaultBadge),
+                            lang
+                        )
+                        val rawPrefix = if (obj.has("customPrefix") && obj.getString("customPrefix").isNotEmpty()) {
+                            com.example.util.LocalizationManager.translateBlockPrefix(obj.getString("customPrefix"), lang)
+                        } else null
+
+                        val rawIconName = if (obj.has("customIconName") && obj.getString("customIconName").isNotEmpty()) {
+                            obj.getString("customIconName")
+                        } else {
+                            when (rawTypeName.uppercase()) {
+                                "З.К.", "V.O.", "Z.K." -> "mic|monospace"
+                                "ТИТР", "TITLE", "TÍTULO", "TITEL", "TITRE", "TITOLO", "TYTUŁ" -> "subtitles|monospace"
+                                "SFX", "ЗВУК" -> "sfx|monospace"
+                                "ЗАМЕТКА", "NOTE", "НОТАТКА", "НАТАТКА", "ЕСКЕРТПЕ", "NOTA", "NOTIZ", "NOTATKA", "NOT" -> "note|sans"
+                                else -> null
+                            }
+                        }
+
+                        list.add(
+                            BlockTemplate(
+                                id = obj.optString("id", java.util.UUID.randomUUID().toString()),
+                                name = rawName,
+                                typeId = obj.optString("typeId", "custom"),
+                                customTypeName = rawTypeName,
+                                customColorHex = obj.optString("customColorHex", "#E5A93C"),
+                                customIconName = rawIconName,
+                                customPrefix = rawPrefix,
+                                alignment = obj.optString("alignment", "LEFT"),
+                                style = BlockStyle(
+                                    isBold = obj.optBoolean("isBold", false),
+                                    isItalic = obj.optBoolean("isItalic", false),
+                                    isUnderline = obj.optBoolean("isUnderline", false),
+                                    isStrikethrough = obj.optBoolean("isStrikethrough", false)
+                                )
+                            )
+                        )
+                    }
+                    _blockTemplates.value = list
+                } catch (e: Exception) {
+                    _blockTemplates.value = getDefaultBlockTemplates(lang)
+                }
+            } else {
+                val defaults = getDefaultBlockTemplates(lang)
+                _blockTemplates.value = defaults
+                persistBlockTemplates(defaults)
+            }
+        }
+    }
+
+    fun saveBlockTemplate(template: BlockTemplate) {
+        viewModelScope.launch {
+            val current = _blockTemplates.value.toMutableList()
+            val existingIndex = current.indexOfFirst { it.id == template.id }
+            if (existingIndex >= 0) {
+                current[existingIndex] = template
+            } else {
+                current.add(0, template)
+            }
+            _blockTemplates.value = current
+            persistBlockTemplates(current)
+        }
+    }
+
+    fun deleteBlockTemplate(id: String) {
+        viewModelScope.launch {
+            val current = _blockTemplates.value.filter { it.id != id }
+            _blockTemplates.value = current
+            persistBlockTemplates(current)
+        }
+    }
+
+    private fun persistBlockTemplates(list: List<BlockTemplate>) {
+        viewModelScope.launch {
+            try {
+                val array = org.json.JSONArray()
+                for (item in list) {
+                    val obj = org.json.JSONObject().apply {
+                        put("id", item.id)
+                        put("name", item.name)
+                        put("typeId", item.typeId)
+                        put("customTypeName", item.customTypeName ?: "")
+                        put("customColorHex", item.customColorHex ?: "")
+                        put("customIconName", item.customIconName ?: "")
+                        put("customPrefix", item.customPrefix ?: "")
+                        put("alignment", item.alignment)
+                        put("isBold", item.style.isBold)
+                        put("isItalic", item.style.isItalic)
+                        put("isUnderline", item.style.isUnderline)
+                        put("isStrikethrough", item.style.isStrikethrough)
+                    }
+                    array.put(obj)
+                }
+                repository.saveBlockTemplatesJson(array.toString())
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    fun setInterfaceStyle(styleId: String) {
+        viewModelScope.launch {
+            repository.saveInterfaceStyle(styleId)
+            _interfaceStyle.value = styleId
+        }
+    }
+
+    fun setPreferredRefreshRate(rate: String) {
+        viewModelScope.launch {
+            repository.savePreferredRefreshRate(rate)
+            _preferredRefreshRate.value = rate
+        }
+    }
+
+    fun setBottomBarStyle(style: String) {
+        viewModelScope.launch {
+            repository.saveBottomBarStyle(style)
+            _bottomBarStyle.value = style
+        }
+    }
+
+    // --- App Locks ---
+    fun checkAppPinStatus(lockIfEnabled: Boolean = false) {
+        viewModelScope.launch {
+            val enabled = repository.isPinEnabled()
+            cachedAppPin = repository.getAppPin()
+            _isPinConfigured.value = enabled
+            if (lockIfEnabled) {
+                _isAppLocked.value = enabled
+            }
+        }
+    }
+
+    fun verifyAppPin(pin: String): Boolean {
+        val isCorrect = cachedAppPin == pin
+        if (isCorrect) {
+            _isAppLocked.value = false
+        }
+        return isCorrect
+    }
+
+    fun setupAppPin(pin: String?) {
+        viewModelScope.launch {
+            repository.setAppPin(pin)
+            checkAppPinStatus(lockIfEnabled = false)
+        }
+    }
+
+    fun lockApp() {
+        if (_isPinConfigured.value) {
+            _isAppLocked.value = true
+        }
+    }
+
+    // --- Projects Management ---
+    fun selectProject(project: WorkspaceProject?) {
+        _selectedProject.value = project
+        _selectedFolder.value = null
+        _activeDocument.value = null
+    }
+
+    fun verifyProjectPassword(project: WorkspaceProject, pass: String): Boolean {
+        return if (project.passwordHash == pass) {
+            _unlockedProjectIds.value = _unlockedProjectIds.value + project.id
+            true
+        } else false
+    }
+
+    fun createProject(title: String, type: String, colorHex: String, password: String? = null) {
+        viewModelScope.launch {
+            val email = if (_authorEmail.value.isEmpty()) "local" else _authorEmail.value
+            val newId = repository.createProject(title, type, colorHex, password, email)
+            triggerProjectSync(newId)
+        }
+    }
+
+    fun updateProject(project: WorkspaceProject) {
+        viewModelScope.launch {
+            repository.updateProject(project)
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun toggleFavoriteProject(project: WorkspaceProject) {
+        viewModelScope.launch {
+            repository.updateProject(project.copy(isFavorite = !project.isFavorite))
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun toggleArchiveProject(project: WorkspaceProject) {
+        viewModelScope.launch {
+            repository.updateProject(project.copy(isArchived = !project.isArchived))
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun sendToTrash(project: WorkspaceProject) {
+        viewModelScope.launch {
+            repository.sendToTrash(project.id)
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun restoreFromTrash(project: WorkspaceProject) {
+        viewModelScope.launch {
+            repository.restoreFromTrash(project.id)
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun permanentDeleteProject(project: WorkspaceProject) {
+        viewModelScope.launch {
+            val uuid = repository.getProjectUuid(project.id)
+            repository.permanentDeleteProject(project.id)
+            
+            val context = appContext
+            val email = _authorEmail.value
+            if (context != null && email.isNotEmpty() && _cloudSyncEnabled.value) {
+                val folderId = GoogleDriveService.getOrCreateAppFolder(context, email)
+                if (folderId != null) {
+                    val fileInfo = GoogleDriveService.findProjectFile(context, email, folderId, uuid)
+                    if (fileInfo != null) {
+                        GoogleDriveService.deleteFile(context, email, fileInfo.first)
+                    }
+                }
+            }
+        }
+    }
+
+    fun renameProject(project: WorkspaceProject, newTitle: String) {
+        viewModelScope.launch {
+            if (newTitle.isNotBlank()) {
+                repository.updateProject(project.copy(title = newTitle))
+                triggerProjectSync(project.id)
+            }
+        }
+    }
+
+    fun moveProject(project: WorkspaceProject, up: Boolean, currentSubTab: String) {
+        viewModelScope.launch {
+            val rawList = when (currentSubTab) {
+                "ARCHIVE" -> archivedProjects.value
+                "TRASH" -> trashProjects.value
+                "FAVORITES" -> activeProjects.value.filter { it.isFavorite }
+                else -> activeProjects.value
+            }
+            val currentList = rawList.toMutableList()
+            val index = currentList.indexOfFirst { it.id == project.id }
+            if (index == -1) return@launch
+            
+            val targetIndex = if (up) index - 1 else index + 1
+            if (targetIndex in 0 until currentList.size) {
+                for (i in currentList.indices) {
+                    currentList[i] = currentList[i].copy(sortOrder = i)
+                }
+                val temp = currentList[index]
+                currentList[index] = currentList[targetIndex].copy(sortOrder = index)
+                currentList[targetIndex] = temp.copy(sortOrder = targetIndex)
+                
+                for (p in currentList) {
+                    repository.updateProject(p)
+                }
+                triggerProjectSync(project.id)
+            }
+        }
+    }
+
+    // --- Folders Management ---
+    fun selectFolder(folder: Folder?) {
+        _selectedFolder.value = folder
+        _activeDocument.value = null
+    }
+
+    fun navigateBackFolder() {
+        val current = _selectedFolder.value
+        if (current != null) {
+            val parentId = current.parentFolderId
+            if (parentId == null) {
+                _selectedFolder.value = null
+            } else {
+                val parent = currentFolders.value.find { it.id == parentId }
+                _selectedFolder.value = parent
+            }
+        }
+    }
+
+    fun createFolder(name: String) {
+        val project = _selectedProject.value ?: return
+        viewModelScope.launch {
+            repository.createFolder(project.id, name, _selectedFolder.value?.id)
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun deleteFolder(folderId: Long) {
+        val projectId = _selectedProject.value?.id
+        viewModelScope.launch {
+            repository.deleteFolder(folderId)
+            if (_selectedFolder.value?.id == folderId) {
+                _selectedFolder.value = null
+            }
+            projectId?.let { triggerProjectSync(it) }
+        }
+    }
+
+    fun moveFolder(folder: Folder, up: Boolean) {
+        viewModelScope.launch {
+            val parentId = folder.parentFolderId
+            val foldersInLevel = currentFolders.value
+                .filter { it.parentFolderId == parentId }
+                .sortedBy { it.sortOrder }
+                .toMutableList()
+            
+            val index = foldersInLevel.indexOfFirst { it.id == folder.id }
+            if (index == -1) return@launch
+            
+            val targetIndex = if (up) index - 1 else index + 1
+            if (targetIndex in 0 until foldersInLevel.size) {
+                for (i in foldersInLevel.indices) {
+                    foldersInLevel[i] = foldersInLevel[i].copy(sortOrder = i)
+                }
+                val temp = foldersInLevel[index]
+                foldersInLevel[index] = foldersInLevel[targetIndex].copy(sortOrder = index)
+                foldersInLevel[targetIndex] = temp.copy(sortOrder = targetIndex)
+                
+                for (f in foldersInLevel) {
+                    repository.updateFolder(f)
+                }
+                triggerProjectSync(folder.projectId)
+            }
+        }
+    }
+
+    fun moveDocument(document: Document, up: Boolean) {
+        viewModelScope.launch {
+            val list = if (document.folderId == null) {
+                currentRootDocuments.value
+            } else {
+                currentFolderDocuments.value
+            }.sortedBy { it.sortOrder }.toMutableList()
+            
+            val index = list.indexOfFirst { it.id == document.id }
+            if (index == -1) return@launch
+            
+            val targetIndex = if (up) index - 1 else index + 1
+            if (targetIndex in 0 until list.size) {
+                for (i in list.indices) {
+                    list[i] = list[i].copy(sortOrder = i)
+                }
+                val temp = list[index]
+                list[index] = list[targetIndex].copy(sortOrder = index)
+                list[targetIndex] = temp.copy(sortOrder = targetIndex)
+                
+                for (d in list) {
+                    repository.updateDocument(d)
+                }
+                triggerProjectSync(document.projectId)
+            }
+        }
+    }
+
+    fun renameFolder(folder: Folder, newName: String) {
+        viewModelScope.launch {
+            if (newName.isNotBlank()) {
+                repository.updateFolder(folder.copy(name = newName))
+                triggerProjectSync(folder.projectId)
+            }
+        }
+    }
+
+    fun moveDocumentToFolder(documentId: Long, targetFolderId: Long?) {
+        val projectId = _selectedProject.value?.id ?: return
+        viewModelScope.launch {
+            repository.moveDocumentToFolder(documentId, targetFolderId)
+            if (_activeDocument.value?.id == documentId) {
+                _activeDocument.value = _activeDocument.value?.copy(folderId = targetFolderId, updatedAt = System.currentTimeMillis())
+            }
+            triggerProjectSync(projectId)
+        }
+    }
+
+    fun moveFolderToFolder(folderId: Long, targetParentFolderId: Long?) {
+        val projectId = _selectedProject.value?.id ?: return
+        if (folderId == targetParentFolderId) return
+        if (targetParentFolderId != null) {
+            val allFolders = currentFolders.value
+            var curr = allFolders.find { it.id == targetParentFolderId }
+            while (curr != null) {
+                if (curr.id == folderId) {
+                    return
+                }
+                curr = curr.parentFolderId?.let { pid -> allFolders.find { it.id == pid } }
+            }
+        }
+        viewModelScope.launch {
+            repository.moveFolderToFolder(folderId, targetParentFolderId)
+            if (_selectedFolder.value?.id == folderId) {
+                _selectedFolder.value = _selectedFolder.value?.copy(parentFolderId = targetParentFolderId)
+            }
+            triggerProjectSync(projectId)
+        }
+    }
+
+    fun renameDocumentInWorkspace(document: Document, newTitle: String) {
+        viewModelScope.launch {
+            if (newTitle.isNotBlank()) {
+                val updated = document.copy(title = newTitle, updatedAt = System.currentTimeMillis())
+                repository.updateDocument(updated)
+                if (_activeDocument.value?.id == document.id) {
+                    _activeDocument.value = updated
+                }
+                triggerProjectSync(document.projectId)
+            }
+        }
+    }
+
+    // --- Documents Management & Editor Core ---
+    fun selectDocument(document: Document?) {
+        _activeDocument.value = document
+        undoStack.clear()
+        redoStack.clear()
+        updateCanUndoRedo()
+        if (document == null) {
+            _editorBlocks.value = emptyList()
+            _activePrompterSettings.value = null
+        } else {
+            val lang = _appLanguage.value
+            var parsedBlocks = converters.toBlocksList(document.contentBlocksJson)
+            if (document.isPlainText && parsedBlocks.size == 1 && parsedBlocks[0].type == "scene" &&
+                com.example.util.LocalizationManager.isDefaultSceneHeading(parsedBlocks[0].text)
+            ) {
+                parsedBlocks = listOf(EditorBlock(type = "action", text = ""))
+            } else {
+                parsedBlocks = parsedBlocks.map { block ->
+                    var b = block
+                    if (!document.isPlainText && b.type == "scene" && com.example.util.LocalizationManager.isDefaultSceneHeading(b.text)) {
+                        b = b.copy(text = com.example.util.LocalizationManager.getDefaultSceneHeading(lang))
+                    }
+                    if (b.type == "custom") {
+                        b = b.copy(
+                            customTypeName = b.customTypeName?.let { com.example.util.LocalizationManager.translateBlockBadge(it, lang) },
+                            customPrefix = b.customPrefix?.let { com.example.util.LocalizationManager.translateBlockPrefix(it, lang) }
+                        )
+                    }
+                    b
+                }
+            }
+            _editorBlocks.value = parsedBlocks
+            
+            // Core initial blocks fallback
+            if (_editorBlocks.value.isEmpty()) {
+                if (document.isPlainText) {
+                    _editorBlocks.value = listOf(EditorBlock(type = "action", text = ""))
+                } else {
+                    val defaultScene = com.example.util.LocalizationManager.getDefaultSceneHeading(lang)
+                    _editorBlocks.value = listOf(EditorBlock(type = "scene", text = defaultScene))
+                }
+            }
+            
+            // Load Prompter
+            viewModelScope.launch {
+                _activePrompterSettings.value = repository.getPrompterSettings(document.id)
+            }
+        }
+        autosaveJob?.cancel()
+    }
+
+    fun createDocument(title: String, isPlainText: Boolean = false) {
+        val project = _selectedProject.value ?: return
+        val folder = _selectedFolder.value
+        viewModelScope.launch {
+            val initialContent = if (isPlainText) {
+                listOf(EditorBlock(type = "action", text = ""))
+            } else {
+                val defaultScene = com.example.util.LocalizationManager.getDefaultSceneHeading(_appLanguage.value)
+                listOf(EditorBlock(type = "scene", text = defaultScene))
+            }
+            val newId = repository.createDocument(project.id, folder?.id, title, initialContent, isPlainText)
+            val createdDoc = repository.getDocumentById(newId)
+            selectDocument(createdDoc)
+            triggerProjectSync(project.id)
+        }
+    }
+
+    fun updateDocumentTitle(newTitle: String) {
+        val doc = _activeDocument.value ?: return
+        _activeDocument.value = doc.copy(title = newTitle)
+        saveActiveDocumentImmediate()
+    }
+
+    fun deleteActiveDocument() {
+        val doc = _activeDocument.value ?: return
+        viewModelScope.launch {
+            repository.deleteDocument(doc.id)
+            selectDocument(null)
+            triggerProjectSync(doc.projectId)
+        }
+    }
+
+    fun deleteDocument(id: Long) {
+        viewModelScope.launch {
+            val doc = repository.getDocumentById(id)
+            repository.deleteDocument(id)
+            if (_activeDocument.value?.id == id) {
+                selectDocument(null)
+            }
+            doc?.let { triggerProjectSync(it.projectId) }
+        }
+    }
+
+    private var activeTypingUndoState: List<EditorBlock>? = null
+    private var typingUndoJob: Job? = null
+
+    fun updateEditorBlocks(newBlocks: List<EditorBlock>, updateHistory: Boolean = true) {
+        if (updateHistory) {
+            typingUndoJob?.cancel()
+            typingUndoJob = null
+            activeTypingUndoState = null
+
+            // Keep maximum 50 levels of Undo/Redo to limit memory footprint
+            if (undoStack.size >= 50) undoStack.removeAt(0)
+            undoStack.add(_editorBlocks.value.toList())
+            redoStack.clear()
+        } else {
+            // Coalesced typing undo logic
+            if (activeTypingUndoState == null) {
+                activeTypingUndoState = _editorBlocks.value.toList()
+                if (undoStack.size >= 50) undoStack.removeAt(0)
+                undoStack.add(_editorBlocks.value.toList())
+                redoStack.clear()
+            }
+            typingUndoJob?.cancel()
+            typingUndoJob = viewModelScope.launch {
+                delay(1200) // Finish typing session after 1.2s of inactivity
+                activeTypingUndoState = null
+            }
+        }
+        _editorBlocks.value = newBlocks
+        triggerAutosave()
+        updateCanUndoRedo()
+    }
+
+    fun undo() {
+        typingUndoJob?.cancel()
+        typingUndoJob = null
+        activeTypingUndoState = null
+
+        if (undoStack.isNotEmpty()) {
+            val previousState = undoStack.removeAt(undoStack.size - 1)
+            redoStack.add(_editorBlocks.value.toList())
+            _editorBlocks.value = previousState
+            saveActiveDocumentImmediate()
+            updateCanUndoRedo()
+        }
+    }
+
+    fun redo() {
+        typingUndoJob?.cancel()
+        typingUndoJob = null
+        activeTypingUndoState = null
+
+        if (redoStack.isNotEmpty()) {
+            val nextState = redoStack.removeAt(redoStack.size - 1)
+            undoStack.add(_editorBlocks.value.toList())
+            _editorBlocks.value = nextState
+            saveActiveDocumentImmediate()
+            updateCanUndoRedo()
+        }
+    }
+
+    private val _canUndo = MutableStateFlow(false)
+    val canUndo: StateFlow<Boolean> = _canUndo.asStateFlow()
+
+    private val _canRedo = MutableStateFlow(false)
+    val canRedo: StateFlow<Boolean> = _canRedo.asStateFlow()
+
+    private fun updateCanUndoRedo() {
+        _canUndo.value = undoStack.isNotEmpty()
+        _canRedo.value = redoStack.isNotEmpty()
+    }
+
+    private fun triggerAutosave() {
+        autosaveJob?.cancel()
+        autosaveJob = viewModelScope.launch {
+            delay(2000) // 2s debounce for autosave
+            saveActiveDocumentImmediate()
+        }
+    }
+
+    fun saveActiveDocumentImmediate() {
+        val doc = _activeDocument.value ?: return
+        val blocks = _editorBlocks.value
+
+        viewModelScope.launch(Dispatchers.Default) {
+            val blocksJson = converters.fromBlocksList(blocks)
+            if (blocksJson == doc.contentBlocksJson) return@launch
+
+            // Calculate written counts increments for statistics on background thread
+            val originalText = converters.toBlocksList(doc.contentBlocksJson).joinToString(" ") { it.text }
+            val newText = blocks.joinToString(" ") { it.text }
+
+            val origWords = countWords(originalText)
+            val newWords = countWords(newText)
+            val wordDiffVal = if (newWords > origWords) newWords - origWords else 0
+
+            val origChars = originalText.length
+            val newChars = newText.length
+            val charDiffVal = if (newChars > origChars) newChars - origChars else 0
+
+            val updatedDoc = doc.copy(contentBlocksJson = blocksJson, updatedAt = System.currentTimeMillis())
+            repository.updateDocument(updatedDoc, statsIncrementWords = wordDiffVal, statsIncrementChars = charDiffVal)
+            if (_activeDocument.value?.id == doc.id) {
+                _activeDocument.value = updatedDoc
+            }
+            triggerProjectSync(updatedDoc.projectId)
+        }
+    }
+
+    // --- Document Versioning Snapshot History ---
+    fun createManualSnapshot(name: String) {
+        val doc = _activeDocument.value ?: return
+        val blocks = _editorBlocks.value
+        viewModelScope.launch(Dispatchers.Default) {
+            val content = converters.fromBlocksList(blocks)
+            repository.saveHistorySnapshot(doc.id, content, name)
+        }
+    }
+
+    fun restoreSnapshot(snapshot: DocumentHistory) {
+        val restoredBlocks = converters.toBlocksList(snapshot.contentBlocksJson)
+        updateEditorBlocks(restoredBlocks, updateHistory = true)
+        saveActiveDocumentImmediate()
+    }
+
+    fun deleteSnapshot(snapshotId: Long) {
+        viewModelScope.launch {
+            repository.deleteHistory(snapshotId)
+        }
+    }
+
+    // --- Prompter Settings Management ---
+    fun updatePrompterSettings(settings: PrompterSettings) {
+        _activePrompterSettings.value = settings
+        viewModelScope.launch {
+            repository.savePrompterSettings(settings)
+        }
+    }
+
+    // --- Metrics counting functions ---
+    fun getDocumentMetrics(): DocumentMetrics {
+        val blocks = _editorBlocks.value
+        var characters = 0
+        var words = 0
+        for (b in blocks) {
+            characters += b.text.length
+            words += countWords(b.text)
+        }
+        // Approximate pages: 300 words standard page density
+        val pages = Math.max(1, (words / 300.0).toInt())
+        // Reading time: standard adult comfortable reading speed is 200 words/min
+        val readingTimeMin = Math.max(1, (words / 200.0).toInt())
+        return DocumentMetrics(words, characters, pages, readingTimeMin)
+    }
+
+    private fun countWords(input: String): Int {
+        var count = 0
+        var inWord = false
+        for (i in 0 until input.length) {
+            val c = input[i]
+            if (c.isWhitespace()) {
+                inWord = false
+            } else if (!inWord) {
+                inWord = true
+                count++
+            }
+        }
+        return count
+    }
+
+    // --- Exports and Imports ---
+    fun exportCurrentDocument(
+        context: Context,
+        format: String,
+        pageSizeName: String = "A4",
+        fontPreference: String = "SERIF",
+        lineSpacingMultiplier: Float = 1.15f,
+        includePageNumbers: Boolean = true
+    ): File? {
+        val doc = _activeDocument.value ?: return null
+        val blocks = _editorBlocks.value
+        val dir = context.cacheDir
+        val fileSuffix = when (format) {
+            "PDF" -> ".pdf"
+            "DOCX" -> ".docx"
+            "RTF" -> ".rtf"
+            else -> ".txt"
+        }
+        val file = File(dir, "${doc.title.replace(" ", "_")}$fileSuffix")
+        try {
+            FileOutputStream(file).use { fos ->
+                when (format) {
+                    "PDF" -> FormatExporter.exportToPdf(
+                        title = doc.title,
+                        blocks = blocks,
+                        outputStream = fos,
+                        pageSizeName = pageSizeName,
+                        fontPreference = fontPreference,
+                        lineSpacingMultiplier = lineSpacingMultiplier,
+                        includePageNumbers = includePageNumbers
+                    )
+                    "DOCX" -> FormatExporter.exportToDocx(doc.title, blocks, fos)
+                    "RTF" -> FormatExporter.exportToRtf(blocks, fos)
+                    else -> FormatExporter.exportToTxt(blocks, fos)
+                }
+            }
+            return file
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return null
+        }
+    }
+
+    fun importExternalText(context: Context, uriString: String, fileExtension: String) {
+        val project = _selectedProject.value ?: return
+        val folder = _selectedFolder.value
+        
+        viewModelScope.launch {
+            try {
+                val uri = android.net.Uri.parse(uriString)
+                val inputStream = context.contentResolver.openInputStream(uri) ?: return@launch
+                
+                // Read imported blocks
+                val blocks = when (fileExtension.uppercase()) {
+                    "DOCX", "HTML" -> FormatExporter.importFromDocx(inputStream)
+                    else -> FormatExporter.importFromTxt(inputStream)
+                }
+                
+                var filename = com.example.util.LocalizationManager.tr("Импорт", "Import", _appLanguage.value) + " ${System.currentTimeMillis()}"
+                try {
+                    context.contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        val nameCol = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (nameCol != -1 && cursor.moveToFirst()) {
+                            val displayName = cursor.getString(nameCol)
+                            if (!displayName.isNullOrBlank()) {
+                                filename = displayName.substringBeforeLast(".")
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+                
+                val isPlainText = fileExtension.uppercase() == "TXT" || fileExtension.uppercase() == "TEXT"
+                repository.createDocument(project.id, folder?.id, filename, blocks, isPlainText = isPlainText)
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+    }
+
+    // --- Backup & Restore Orchestration ---
+    fun runBackup(context: Context, onComplete: (String?) -> Unit) {
+        viewModelScope.launch {
+            try {
+                val backupText = repository.exportBackupJson(context)
+                onComplete(backupText)
+            } catch (e: Exception) {
+                onComplete(null)
+            }
+        }
+    }
+
+    fun runRestore(context: Context, backupText: String, onComplete: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val email = _authorEmail.value
+            val overrideOwner = if (email.isEmpty()) "local" else email
+            val resultList = repository.importBackupJson(backupText, overrideOwner)
+            if (resultList != null) {
+                loadAppLanguage()
+                if (email.isNotEmpty() && _cloudSyncEnabled.value) {
+                    resultList.forEach { pId ->
+                        markProjectDirtyAndSync(context, pId)
+                    }
+                }
+                onComplete(true)
+            } else {
+                onComplete(false)
+            }
+        }
+    }
+
+    // --- Google Keep Notes Import ---
+    fun importGoogleKeepNotesFromUris(
+        context: Context,
+        uris: List<android.net.Uri>,
+        targetProjectId: Long?,
+        newProjectTitle: String?,
+        isPlainText: Boolean = true,
+        onComplete: (Int, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val notes = com.example.util.KeepImporter.parseUris(context, uris)
+                if (notes.isEmpty()) {
+                    onComplete(0, com.example.util.LocalizationManager.tr("Не удалось распознать заметки во выбранных файлах.", "Could not recognize notes in the selected files.", _appLanguage.value))
+                    return@launch
+                }
+
+                val email = if (_authorEmail.value.isEmpty()) "local" else _authorEmail.value
+                val pId = targetProjectId ?: repository.createProject(
+                    title = newProjectTitle?.ifBlank { "Google Keep" } ?: "Google Keep",
+                    type = "TEXT",
+                    colorHex = "#FFBB00",
+                    password = null,
+                    ownerEmail = email
+                )
+
+                val importedCount = repository.importKeepNotes(pId, notes, isPlainText = isPlainText)
+                triggerProjectSync(pId)
+                onComplete(importedCount, null)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                onComplete(0, e.localizedMessage ?: com.example.util.LocalizationManager.tr("Ошибка при импорте заметок Keep", "Error importing Keep notes", _appLanguage.value))
+            }
+        }
+    }
+
+    fun importGoogleKeepNotesFromRawText(
+        rawText: String,
+        targetProjectId: Long?,
+        newProjectTitle: String?,
+        isPlainText: Boolean = true,
+        onComplete: (Int, String?) -> Unit
+    ) {
+        viewModelScope.launch {
+            try {
+                val notes = com.example.util.KeepImporter.parseRawText(rawText)
+                if (notes.isEmpty()) {
+                    onComplete(0, com.example.util.LocalizationManager.tr("Не удалось распознать заметки из введенного текста.", "Could not recognize notes from the entered text.", _appLanguage.value))
+                    return@launch
+                }
+
+                val email = if (_authorEmail.value.isEmpty()) "local" else _authorEmail.value
+                val pId = targetProjectId ?: repository.createProject(
+                    title = newProjectTitle?.ifBlank { "Google Keep" } ?: "Google Keep",
+                    type = "TEXT",
+                    colorHex = "#FFBB00",
+                    password = null,
+                    ownerEmail = email
+                )
+
+                val importedCount = repository.importKeepNotes(pId, notes, isPlainText = isPlainText)
+                triggerProjectSync(pId)
+                onComplete(importedCount, null)
+            } catch (e: Exception) {
+                e.printStackTrace()
+                onComplete(0, e.localizedMessage ?: com.example.util.LocalizationManager.tr("Ошибка при импорте заметок Keep", "Error importing Keep notes", _appLanguage.value))
+            }
+        }
+    }
+
+    fun syncProjectsToInternalMemory(context: Context, onComplete: (Boolean, String) -> Unit) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                // 1. Get all projects, folders, documents
+                val projects = repository.getAllProjectsDirectList()
+                val folders = repository.getAllFoldersDirectList()
+                val documents = repository.getAllDocumentsDirectList()
+
+                // 2. Define root folder inside standard public Documents folder
+                var rootDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS), "WriterStudioProjects")
+                var isWritable = false
+                try {
+                    if (!rootDir.exists()) {
+                        rootDir.mkdirs()
+                    }
+                    val testFile = File(rootDir, ".write_test")
+                    testFile.writeText("test")
+                    testFile.delete()
+                    isWritable = true
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                // Fallback directory in external storage
+                if (!isWritable) {
+                    rootDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "WriterStudioProjects")
+                    if (!rootDir.exists()) {
+                        rootDir.mkdirs()
+                    }
+                }
+
+                // Clean-up previous export
+                if (rootDir.exists()) {
+                    rootDir.deleteRecursively()
+                }
+                rootDir.mkdirs()
+
+                // 3. Subcategories based on active, archived, or trashed states
+                val lang = appLanguage.value
+                val activeDirName = com.example.util.LocalizationManager.tr("Активные", "Active", lang)
+                val archiveDirName = com.example.util.LocalizationManager.tr("Архив", "Archive", lang)
+                val trashDirName = com.example.util.LocalizationManager.tr("Корзина", "Trash", lang)
+                val untitledLabel = com.example.util.LocalizationManager.tr("Без названия", "Untitled", lang)
+                val newFolderLabel = com.example.util.LocalizationManager.tr("Новая папка", "New Folder", lang)
+
+                val activeDir = File(rootDir, activeDirName).apply { mkdirs() }
+                val archiveDir = File(rootDir, archiveDirName).apply { mkdirs() }
+                val trashDir = File(rootDir, trashDirName).apply { mkdirs() }
+
+                val converters = com.example.data.local.Converters()
+
+                for (project in projects) {
+                    val targetParentDir = when {
+                        project.isInTrash -> trashDir
+                        project.isArchived -> archiveDir
+                        else -> activeDir
+                    }
+
+                    // Sanitize project name
+                    val projSlug = project.title.replace("[\\\\/*?:\"<>|]".toRegex(), "_").trim()
+                    val projDirName = if (projSlug.isEmpty()) "$untitledLabel (${project.id})" else projSlug
+                    val projFolder = File(targetParentDir, projDirName).apply { mkdirs() }
+
+                    // Handle folders inside this project recursively (infinite depth safe)
+                    val projectFolders = folders.filter { f -> f.projectId == project.id }
+                    val createdFoldersMap = mutableMapOf<Long, File>()
+                    val remainingFolders = projectFolders.toMutableList()
+                    var iterations = 0
+                    while (remainingFolders.isNotEmpty() && iterations < 20) {
+                        val iterator = remainingFolders.iterator()
+                        var resolvedAny = false
+                        while (iterator.hasNext()) {
+                            val folder = iterator.next()
+                            val parentDir = if (folder.parentFolderId == null) {
+                                projFolder
+                            } else {
+                                createdFoldersMap[folder.parentFolderId]
+                            }
+
+                            if (parentDir != null) {
+                                val folderSlug = folder.name.replace("[\\\\/*?:\"<>|]".toRegex(), "_").trim()
+                                val folderDirName = if (folderSlug.isEmpty()) "$newFolderLabel (${folder.id})" else folderSlug
+                                val dir = File(parentDir, folderDirName).apply { mkdirs() }
+                                createdFoldersMap[folder.id] = dir
+                                iterator.remove()
+                                resolvedAny = true
+                            }
+                        }
+                        if (!resolvedAny) {
+                            break
+                        }
+                        iterations++
+                    }
+
+                    // Fallback for any remaining unmapped or cylic folders
+                    for (folder in remainingFolders) {
+                        val folderSlug = folder.name.replace("[\\\\/*?:\"<>|]".toRegex(), "_").trim()
+                        val folderDirName = if (folderSlug.isEmpty()) "$newFolderLabel (${folder.id})" else folderSlug
+                        val dir = File(projFolder, folderDirName).apply { mkdirs() }
+                        createdFoldersMap[folder.id] = dir
+                    }
+
+                    // Export all markdown/blocks documents for this project
+                    val projectDocuments = documents.filter { d -> d.projectId == project.id }
+                    for (doc in projectDocuments) {
+                        val parentDir = if (doc.folderId != null) {
+                            createdFoldersMap[doc.folderId] ?: projFolder
+                        } else {
+                            projFolder
+                        }
+
+                        val docSlug = doc.title.replace("[\\\\/*?:\"<>|]".toRegex(), "_").trim()
+                        val docFileName = if (docSlug.isEmpty()) "$untitledLabel (${doc.id})" else docSlug
+
+                        // Export as text document
+                        val txtFile = File(parentDir, "$docFileName.txt")
+                        val blocks = converters.toBlocksList(doc.contentBlocksJson)
+                        val textBuilder = StringBuilder()
+                        for (block in blocks) {
+                            if (block.type == "image") {
+                                textBuilder.append("[${com.example.util.LocalizationManager.getString("image", lang)}: ${block.imageCaption ?: untitledLabel}]\n")
+                            } else {
+                                textBuilder.append(block.text)
+                                textBuilder.append("\n")
+                            }
+                        }
+                        txtFile.writeText(textBuilder.toString())
+
+                        // Export full JSON with styling metadata alongside
+                        val jsonFile = File(parentDir, "$docFileName.json")
+                        val docObj = JSONObject().apply {
+                            put("id", doc.id)
+                            put("projectId", doc.projectId)
+                            put("title", doc.title)
+                            put("contentBlocksJson", doc.contentBlocksJson)
+                            put("sortOrder", doc.sortOrder)
+                            put("isPlainText", doc.isPlainText)
+                            put("createdAt", doc.createdAt)
+                            put("updatedAt", doc.updatedAt)
+                        }
+                        jsonFile.writeText(docObj.toString(4))
+                    }
+                }
+
+                withContext(Dispatchers.Main) {
+                    onComplete(true, rootDir.absolutePath)
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    onComplete(false, e.localizedMessage ?: "Unknown Error")
+                }
+            }
+        }
+    }
+}
+
+data class DocumentMetrics(
+    val words: Int,
+    val characters: Int,
+    val pages: Int,
+    val readingTimeMinutes: Int
+)
+
+class WriterViewModelFactory(private val repository: WriterRepository) : ViewModelProvider.Factory {
+    override fun <T : ViewModel> create(modelClass: Class<T>): T {
+        if (modelClass.isAssignableFrom(WriterViewModel::class.java)) {
+            @Suppress("UNCHECKED_CAST")
+            return WriterViewModel(repository) as T
+        }
+        throw IllegalArgumentException("Unknown ViewModel class")
+    }
+}

@@ -1,0 +1,167 @@
+package com.example.data.local
+
+import androidx.room.*
+import com.example.data.entity.*
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface ProjectDao {
+    @Query("SELECT * FROM projects WHERE isInTrash = 0 AND isArchived = 0 AND ownerEmail = :ownerEmail ORDER BY sortOrder ASC, updatedAt DESC")
+    fun getAllActiveProjectsFlow(ownerEmail: String): Flow<List<WorkspaceProject>>
+
+    @Query("SELECT * FROM projects WHERE isArchived = 1 AND isInTrash = 0 AND ownerEmail = :ownerEmail ORDER BY sortOrder ASC, updatedAt DESC")
+    fun getArchivedProjectsFlow(ownerEmail: String): Flow<List<WorkspaceProject>>
+
+    @Query("SELECT * FROM projects WHERE isInTrash = 1 AND ownerEmail = :ownerEmail ORDER BY sortOrder ASC, updatedAt DESC")
+    fun getTrashProjectsFlow(ownerEmail: String): Flow<List<WorkspaceProject>>
+
+    @Query("SELECT * FROM projects WHERE id = :id LIMIT 1")
+    suspend fun getProjectById(id: Long): WorkspaceProject?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertProject(project: WorkspaceProject): Long
+
+    @Update
+    suspend fun updateProject(project: WorkspaceProject)
+
+    @Query("UPDATE projects SET isInTrash = 1, updatedAt = :timestamp WHERE id = :projectId")
+    suspend fun sendToTrash(projectId: Long, timestamp: Long = System.currentTimeMillis())
+
+    @Query("UPDATE projects SET isInTrash = 0, updatedAt = :timestamp WHERE id = :projectId")
+    suspend fun restoreFromTrash(projectId: Long, timestamp: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM projects WHERE id = :projectId")
+    suspend fun hardDeleteProject(projectId: Long)
+
+    @Query("SELECT * FROM projects")
+    suspend fun getAllProjectsDirect(): List<WorkspaceProject>
+
+    @Query("SELECT MAX(sortOrder) FROM projects")
+    suspend fun getMaxSortOrder(): Int?
+}
+
+@Dao
+interface FolderDao {
+    @Query("SELECT * FROM folders WHERE projectId = :projectId ORDER BY sortOrder ASC, createdAt ASC")
+    fun getFoldersForProjectFlow(projectId: Long): Flow<List<Folder>>
+
+    @Query("SELECT * FROM folders WHERE projectId = :projectId ORDER BY sortOrder ASC, createdAt ASC")
+    suspend fun getFoldersForProjectDirect(projectId: Long): List<Folder>
+
+    @Query("SELECT * FROM folders WHERE id = :folderId LIMIT 1")
+    suspend fun getFolderById(folderId: Long): Folder?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertFolder(folder: Folder): Long
+
+    @Update
+    suspend fun updateFolder(folder: Folder)
+
+    @Query("UPDATE folders SET parentFolderId = :parentFolderId WHERE id = :folderId")
+    suspend fun updateFolderParent(folderId: Long, parentFolderId: Long?)
+
+    @Query("DELETE FROM folders WHERE id = :folderId")
+    suspend fun deleteFolder(folderId: Long)
+
+    @Query("DELETE FROM folders WHERE projectId = :projectId")
+    suspend fun deleteFoldersByProject(projectId: Long)
+
+    @Query("SELECT * FROM folders")
+    suspend fun getAllFoldersDirect(): List<Folder>
+}
+
+@Dao
+interface DocumentDao {
+    @Query("SELECT * FROM documents WHERE projectId = :projectId AND folderId IS NULL ORDER BY sortOrder ASC, createdAt ASC")
+    fun getRootDocumentsFlow(projectId: Long): Flow<List<Document>>
+
+    @Query("SELECT * FROM documents WHERE projectId = :projectId AND folderId = :folderId ORDER BY sortOrder ASC, createdAt ASC")
+    fun getDocumentsByFolderFlow(projectId: Long, folderId: Long): Flow<List<Document>>
+
+    @Query("SELECT * FROM documents WHERE projectId = :projectId ORDER BY sortOrder ASC")
+    fun getAllProjectDocuments(projectId: Long): List<Document>
+
+    @Query("SELECT * FROM documents WHERE id = :id LIMIT 1")
+    suspend fun getDocumentById(id: Long): Document?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertDocument(document: Document): Long
+
+    @Update
+    suspend fun updateDocument(document: Document)
+
+    @Query("UPDATE documents SET folderId = :folderId, updatedAt = :updatedAt WHERE id = :documentId")
+    suspend fun updateDocumentFolder(documentId: Long, folderId: Long?, updatedAt: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM documents WHERE id = :id")
+    suspend fun deleteDocument(id: Long)
+
+    @Query("DELETE FROM documents WHERE projectId = :projectId")
+    suspend fun deleteDocumentsByProject(projectId: Long)
+
+    @Query("SELECT * FROM documents")
+    suspend fun getAllDocumentsDirect(): List<Document>
+}
+
+@Dao
+interface DocumentHistoryDao {
+    @Query("SELECT * FROM document_history WHERE documentId = :documentId ORDER BY timestamp DESC")
+    fun getHistoryForDocumentFlow(documentId: Long): Flow<List<DocumentHistory>>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertHistory(history: DocumentHistory): Long
+
+    @Query("DELETE FROM document_history WHERE id = :id")
+    suspend fun deleteHistory(id: Long)
+
+    @Query("DELETE FROM document_history WHERE documentId = :documentId")
+    suspend fun deleteHistoryByDocument(documentId: Long)
+
+    @Query("SELECT * FROM document_history")
+    suspend fun getAllHistoryDirect(): List<DocumentHistory>
+}
+
+@Dao
+interface PrompterSettingsDao {
+    @Query("SELECT * FROM prompter_settings WHERE documentId = :documentId LIMIT 1")
+    suspend fun getPrompterSettings(documentId: Long): PrompterSettings?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun savePrompterSettings(settings: PrompterSettings)
+
+    @Query("SELECT * FROM prompter_settings")
+    suspend fun getAllPrompterSettingsDirect(): List<PrompterSettings>
+}
+
+@Dao
+interface StatsDao {
+    @Query("SELECT * FROM productivity_stats ORDER BY dateString DESC")
+    fun getAllStatsFlow(): Flow<List<ProductivityStat>>
+
+    @Query("SELECT * FROM productivity_stats WHERE dateString = :dateString LIMIT 1")
+    suspend fun getStatForDate(dateString: String): ProductivityStat?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertStat(stat: ProductivityStat)
+
+    @Query("SELECT * FROM productivity_stats")
+    suspend fun getAllStatsDirect(): List<ProductivityStat>
+}
+
+@Dao
+interface SettingsDao {
+    @Query("SELECT configValue FROM app_settings WHERE configKey = :key LIMIT 1")
+    suspend fun getSetting(key: String): String?
+
+    @Query("SELECT configKey FROM app_settings WHERE configKey LIKE 'drive_uuid_%' AND configValue = :uuid LIMIT 1")
+    suspend fun findDriveUuidKey(uuid: String): String?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun saveSetting(setting: AppSetting)
+
+    @Query("DELETE FROM app_settings WHERE configKey = :key")
+    suspend fun deleteSetting(key: String)
+
+    @Query("SELECT * FROM app_settings")
+    suspend fun getAllSettingsDirect(): List<AppSetting>
+}

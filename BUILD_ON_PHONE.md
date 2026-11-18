@@ -1,0 +1,1 @@
+Upload the extracted project files to the root of a private GitHub repository. Open Actions > Build Writer Studio APK > Run workflow. Download the artifact when successful. This build has not been tested.
